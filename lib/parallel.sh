@@ -41,6 +41,41 @@ _throttle_jobs() {
     done
 }
 
+# Kill a parallel job that has exceeded PARALLEL_JOB_TIMEOUT_SECONDS.
+# Usage: _timeout_kill_job <pid> <func_name> <duration_sec>
+# Sends SIGTERM, polls every second up to PARALLEL_KILL_GRACE_SECONDS, then SIGKILL
+# if still alive. Persists FAIL + reason=timeout to the same .status_<fn> /
+# .status_reason_<fn> files end_func writes, so _parallel_emit_job_output renders
+# the timeout reason on the FAIL badge without any schema extension.
+# Uses 'function' keyword per CONVENTIONS.md §Function Naming; sibling helpers in
+# this file that omit it predate the rule and are a Phase 5 DOCS-01 followup, not
+# a precedent for new code.
+function _timeout_kill_job() {
+    local pid="$1" func_name="$2" duration_sec="$3"
+    local grace="${PARALLEL_KILL_GRACE_SECONDS:-10}"
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=10
+
+    # D-13: TERM first, then KILL after grace seconds for tools that ignore TERM.
+    kill -TERM "$pid" 2>/dev/null || true
+    local i
+    for ((i=0; i<grace; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+
+    # D-14: persist FAIL + reason=timeout via the same pattern as modules/core.sh:1505-1509.
+    if [[ -n "${called_fn_dir:-}" ]]; then
+        printf "FAIL\n" >"${called_fn_dir}/.status_${func_name}" 2>/dev/null || true
+        printf "timeout\n" >"${called_fn_dir}/.status_reason_${func_name}" 2>/dev/null || true
+    fi
+
+    # Structured log; no-op when STRUCTURED_LOGGING != true (modules/core.sh:680).
+    if declare -F log_json >/dev/null 2>&1; then
+        log_json "ERROR" "${func_name}" "Job timed out" "reason=timeout" "duration_sec=${duration_sec}"
+    fi
+}
+
 _parallel_live_break() {
     if declare -F ui_live_progress_break >/dev/null 2>&1; then
         ui_live_progress_break
@@ -258,7 +293,7 @@ _parallel_emit_job_output() {
                     printf "         %s\n" "$line"
                 done
             fi
-            if [[ -n "$reason_code" ]] && { [[ "$badge" == "SKIP" ]] || { [[ "$badge" == "CACHE" ]] && [[ "${SHOW_CACHE:-false}" == "true" ]]; }; }; then
+            if [[ -n "$reason_code" ]] && { [[ "$badge" == "SKIP" ]] || [[ "$badge" == "FAIL" ]] || { [[ "$badge" == "CACHE" ]] && [[ "${SHOW_CACHE:-false}" == "true" ]]; }; }; then
                 printf "         reason: %s\n" "$reason_code"
             fi
             ;;
@@ -276,7 +311,7 @@ _parallel_emit_job_output() {
             if [[ -s "$log_file" ]]; then
                 tail -n "$show_lines" "$log_file" | strip_ansi_stream
             fi
-            if [[ -n "$reason_code" ]] && { [[ "$badge" == "SKIP" ]] || { [[ "$badge" == "CACHE" ]] && [[ "${SHOW_CACHE:-false}" == "true" ]]; }; }; then
+            if [[ -n "$reason_code" ]] && { [[ "$badge" == "SKIP" ]] || [[ "$badge" == "FAIL" ]] || { [[ "$badge" == "CACHE" ]] && [[ "${SHOW_CACHE:-false}" == "true" ]]; }; }; then
                 printf "         reason: %s\n" "$reason_code"
             fi
             ;;
@@ -292,7 +327,7 @@ _parallel_emit_job_output() {
             if [[ -s "$log_file" ]]; then
                 cat "$log_file" | strip_ansi_stream
             fi
-            if [[ -n "$reason_code" ]] && { [[ "$badge" == "SKIP" ]] || { [[ "$badge" == "CACHE" ]] && [[ "${SHOW_CACHE:-false}" == "true" ]]; }; }; then
+            if [[ -n "$reason_code" ]] && { [[ "$badge" == "SKIP" ]] || [[ "$badge" == "FAIL" ]] || { [[ "$badge" == "CACHE" ]] && [[ "${SHOW_CACHE:-false}" == "true" ]]; }; }; then
                 printf "         reason: %s\n" "$reason_code"
             fi
             ;;
@@ -443,6 +478,12 @@ parallel_funcs() {
                         if kill -0 "${batch_pids[$idx]}" 2>/dev/null; then
                             alive=1
                             job_dur=$((now - batch_starts[$idx]))
+                            # Timeout enforcement (RESIL-03 / D-11..D-14): if PARALLEL_JOB_TIMEOUT_SECONDS > 0
+                            # and the live job has exceeded it, TERM-then-KILL and persist FAIL + reason=timeout.
+                            local _to="${PARALLEL_JOB_TIMEOUT_SECONDS:-0}"
+                            if [[ "$_to" =~ ^[0-9]+$ ]] && (( _to > 0 )) && (( job_dur > _to )); then
+                                _timeout_kill_job "${batch_pids[$idx]}" "${batch_funcs[$idx]}" "$job_dur"
+                            fi
                             dur_fmt=$(format_duration "$job_dur")
                             if [[ -z "$hb_active_list" ]]; then
                                 hb_active_list="${batch_funcs[$idx]} ${dur_fmt}"
@@ -547,6 +588,12 @@ parallel_funcs() {
                     if kill -0 "${batch_pids[$idx]}" 2>/dev/null; then
                         alive=1
                         job_dur=$((now - batch_starts[$idx]))
+                        # Timeout enforcement (RESIL-03 / D-11..D-14): if PARALLEL_JOB_TIMEOUT_SECONDS > 0
+                        # and the live job has exceeded it, TERM-then-KILL and persist FAIL + reason=timeout.
+                        local _to="${PARALLEL_JOB_TIMEOUT_SECONDS:-0}"
+                        if [[ "$_to" =~ ^[0-9]+$ ]] && (( _to > 0 )) && (( job_dur > _to )); then
+                            _timeout_kill_job "${batch_pids[$idx]}" "${batch_funcs[$idx]}" "$job_dur"
+                        fi
                         dur_fmt=$(format_duration "$job_dur")
                         if [[ -z "$hb_active_list" ]]; then
                             hb_active_list="${batch_funcs[$idx]} ${dur_fmt}"
